@@ -9,8 +9,9 @@ use std::{
 use crate::core::{
     context::ffmpeg_context::open_input_file, scheduler::ffmpeg_scheduler::STATUS_INIT,
 };
-use ffmpeg_next::{packet::Ref as _, Frame, Packet};
+use ffmpeg_next::{codec::debug, packet::Ref as _, Frame, Packet};
 use ffmpeg_sys_next::av_frame_alloc;
+use log::debug;
 
 use crate::{
     core::{
@@ -77,7 +78,7 @@ impl FfmpegDynamicScheduler {
         }
     }
 
-    pub fn start(mut self) -> crate::error::Result<()> {
+    pub fn start(&self) -> crate::error::Result<()> {
         let packet_pool = self.packet_pool.clone();
         let frame_pool = self.frame_pool.clone();
         let scheduler_status = self.status.clone();
@@ -294,13 +295,10 @@ impl FfmpegDynamicScheduler {
     }
 
     pub fn add_input(&self, mut input: Input, copy_ts: bool) -> crate::error::Result<()> {
-        if self.status.load(Ordering::Acquire) != STATUS_END {
-            return Err(crate::error::Error::Exit);
-        }
-
         let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
-        let demux_idx = ffmpeg_context.demuxs.len() + 1;
+        let demux_idx = ffmpeg_context.demuxs.len();
         let state = &self.get_input_state(demux_idx);
+        debug!("Start adding input {}: {:?}", demux_idx, input.url);
         let mut demuxer = unsafe { open_input_file(demux_idx, &mut input, copy_ts) }?;
 
         // Input frame filter pipeline
@@ -353,6 +351,7 @@ impl FfmpegDynamicScheduler {
         }
 
         ffmpeg_context.demuxs.push(demuxer);
+        debug!("Added input {}: {:?}", demux_idx, input.url);
 
         Ok(())
     }
@@ -365,7 +364,10 @@ impl FfmpegDynamicScheduler {
         let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
         if let Some(demuxer) = ffmpeg_context.demuxs.get(idx) {
             in_fmt_ctx_free(demuxer.in_fmt_ctx, demuxer.is_set_read_callback);
-            ffmpeg_context.demuxs.remove(idx);
+            let demuxer = ffmpeg_context.demuxs.remove(idx);
+            debug!("Removed input {}: {}", idx, demuxer.url);
+        } else {
+            debug!("Failed to remove input {}: not found", idx);
         }
 
         Ok(())
