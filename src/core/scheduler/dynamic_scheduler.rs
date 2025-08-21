@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex, RwLock,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+    },
 };
 
 use crate::core::{
@@ -32,12 +35,30 @@ use crate::{
 
 pub struct FfmpegDynamicScheduler {
     ffmpeg_context: Arc<RwLock<FfmpegContext>>,
+
     thread_sync: ThreadSynchronizer,
     status: Arc<AtomicUsize>,
     result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 
+    inputs_state: Arc<Mutex<HashMap<usize, State>>>,
+    outputs_state: Arc<Mutex<HashMap<usize, State>>>,
+
     packet_pool: ObjPool<Packet>,
     frame_pool: ObjPool<Frame>,
+}
+
+struct State {
+    status: Arc<AtomicUsize>,
+    result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+}
+
+impl Clone for State {
+    fn clone(&self) -> Self {
+        Self {
+            status: self.status.clone(),
+            result: self.result.clone(),
+        }
+    }
 }
 
 impl FfmpegDynamicScheduler {
@@ -47,6 +68,9 @@ impl FfmpegDynamicScheduler {
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
             thread_sync: ThreadSynchronizer::new(),
             result: Arc::new(Mutex::new(None)),
+
+            inputs_state: Arc::new(Mutex::new(HashMap::new())),
+            outputs_state: Arc::new(Mutex::new(HashMap::new())),
 
             packet_pool: ObjPool::new(64, new_packet, unref_packet, packet_is_null).unwrap(),
             frame_pool: ObjPool::new(64, new_frame, unref_frame, frame_is_null).unwrap(),
@@ -83,16 +107,11 @@ impl FfmpegDynamicScheduler {
 
         // Muxer
         {
-            for (mux_idx, mux) in self
-                .ffmpeg_context
-                .write()
-                .unwrap()
-                .muxs
-                .iter_mut()
-                .enumerate()
-            {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            for (mux_idx, mux) in ffmpeg_context.muxs.iter_mut().enumerate() {
                 // Even if it's not ready here, it's going to be ready later, so it locks first
                 thread_sync.thread_start();
+                let state = &self.get_output_state(mux_idx);
                 if mux.is_ready() {
                     if let Err(e) = mux_init(
                         mux_idx,
@@ -100,11 +119,12 @@ impl FfmpegDynamicScheduler {
                         packet_pool.clone(),
                         input_controller.clone(),
                         mux.mux_stream_nodes.clone(),
-                        scheduler_status.clone(),
+                        state.status.clone(),
                         thread_sync.clone(),
-                        scheduler_result.clone(),
+                        state.result.clone(),
                     ) {
-                        Self::cleanup(&scheduler_status, &self.ffmpeg_context);
+                        drop(ffmpeg_context);
+                        self.cleanup(&scheduler_status);
                         return Err(e);
                     }
                 }
@@ -113,8 +133,9 @@ impl FfmpegDynamicScheduler {
 
         // Output frame filter pipeline
         {
-            let ffmpeg_context = &mut self.ffmpeg_context;
-            for (mux_idx, mux) in ffmpeg_context.write().unwrap().muxs.iter_mut().enumerate() {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            for (mux_idx, mux) in ffmpeg_context.muxs.iter_mut().enumerate() {
+                let state = &self.get_output_state(mux_idx);
                 if let Some(frame_pipelines) = mux.frame_pipelines.take() {
                     for frame_pipeline in frame_pipelines {
                         if let Err(e) = output_pipeline_init(
@@ -122,10 +143,11 @@ impl FfmpegDynamicScheduler {
                             frame_pipeline,
                             mux.get_streams_mut(),
                             frame_pool.clone(),
-                            scheduler_status.clone(),
-                            scheduler_result.clone(),
+                            state.status.clone(),
+                            state.result.clone(),
                         ) {
-                            Self::cleanup(&scheduler_status, ffmpeg_context);
+                            drop(ffmpeg_context);
+                            self.cleanup(&scheduler_status);
                             return Err(e);
                         }
                     }
@@ -135,16 +157,17 @@ impl FfmpegDynamicScheduler {
 
         // Encoder
         {
-            let ffmpeg_context = &mut self.ffmpeg_context;
-            for (mux_idx, mux) in &mut ffmpeg_context.write().unwrap().muxs.iter_mut().enumerate() {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            for (mux_idx, mux) in &mut ffmpeg_context.muxs.iter_mut().enumerate() {
+                let state = &self.get_output_state(mux_idx);
                 let ready_sender = ready_to_init_mux(
                     mux_idx,
                     mux,
                     packet_pool.clone(),
                     input_controller.clone(),
-                    scheduler_status.clone(),
+                    state.status.clone(),
                     thread_sync.clone(),
-                    scheduler_result.clone(),
+                    state.result.clone(),
                 );
 
                 for enc_stream in mux.take_streams_mut() {
@@ -164,10 +187,11 @@ impl FfmpegDynamicScheduler {
                         mux.oformat_flags,
                         frame_pool.clone(),
                         packet_pool.clone(),
-                        scheduler_status.clone(),
-                        scheduler_result.clone(),
+                        state.status.clone(),
+                        state.result.clone(),
                     ) {
-                        Self::cleanup(&scheduler_status, ffmpeg_context);
+                        drop(ffmpeg_context);
+                        self.cleanup(&scheduler_status);
                         return Err(e);
                     }
                 }
@@ -176,14 +200,8 @@ impl FfmpegDynamicScheduler {
 
         // Filter graph
         {
-            let ffmpeg_context = &mut self.ffmpeg_context;
-            for (i, filter_graph) in ffmpeg_context
-                .write()
-                .unwrap()
-                .filter_graphs
-                .iter_mut()
-                .enumerate()
-            {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            for (i, filter_graph) in ffmpeg_context.filter_graphs.iter_mut().enumerate() {
                 if let Err(e) = filter_graph_init(
                     i,
                     filter_graph,
@@ -193,7 +211,8 @@ impl FfmpegDynamicScheduler {
                     scheduler_status.clone(),
                     scheduler_result.clone(),
                 ) {
-                    Self::cleanup(&scheduler_status, ffmpeg_context);
+                    drop(ffmpeg_context);
+                    self.cleanup(&scheduler_status);
                     return Err(e);
                 }
             }
@@ -201,14 +220,9 @@ impl FfmpegDynamicScheduler {
 
         // Input frame filter pipeline
         {
-            let ffmpeg_context = &mut self.ffmpeg_context;
-            for (demux_idx, demux) in ffmpeg_context
-                .write()
-                .unwrap()
-                .demuxs
-                .iter_mut()
-                .enumerate()
-            {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            for (demux_idx, demux) in ffmpeg_context.demuxs.iter_mut().enumerate() {
+                let state = &self.get_input_state(demux_idx);
                 if let Some(frame_pipelines) = demux.frame_pipelines.take() {
                     for frame_pipeline in frame_pipelines {
                         if let Err(e) = input_pipeline_init(
@@ -216,10 +230,11 @@ impl FfmpegDynamicScheduler {
                             frame_pipeline,
                             demux.get_streams_mut(),
                             frame_pool.clone(),
-                            scheduler_status.clone(),
-                            scheduler_result.clone(),
+                            state.status.clone(),
+                            state.result.clone(),
                         ) {
-                            Self::cleanup(&scheduler_status, ffmpeg_context);
+                            drop(ffmpeg_context);
+                            self.cleanup(&scheduler_status);
                             return Err(e);
                         }
                     }
@@ -229,16 +244,10 @@ impl FfmpegDynamicScheduler {
 
         // Decoder
         {
-            let ffmpeg_context = &mut self.ffmpeg_context;
-            for (demux_idx, demux) in ffmpeg_context
-                .write()
-                .unwrap()
-                .demuxs
-                .iter_mut()
-                .enumerate()
-            {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            for (demux_idx, demux) in ffmpeg_context.demuxs.iter_mut().enumerate() {
                 let exit_on_error = demux.exit_on_error;
-
+                let state = &self.get_input_state(demux_idx);
                 for dec_stream in demux.get_streams_mut() {
                     if let Err(e) = dec_init(
                         demux_idx,
@@ -246,10 +255,11 @@ impl FfmpegDynamicScheduler {
                         exit_on_error,
                         frame_pool.clone(),
                         packet_pool.clone(),
-                        scheduler_status.clone(),
-                        scheduler_result.clone(),
+                        state.status.clone(),
+                        state.result.clone(),
                     ) {
-                        Self::cleanup(&scheduler_status, ffmpeg_context);
+                        drop(ffmpeg_context);
+                        self.cleanup(&scheduler_status);
                         return Err(e);
                     }
                 }
@@ -258,25 +268,21 @@ impl FfmpegDynamicScheduler {
 
         // Demuxer
         {
-            let ffmpeg_context = &mut self.ffmpeg_context;
-            let independent_readrate = ffmpeg_context.read().unwrap().independent_readrate;
-            for (demux_idx, demux) in ffmpeg_context
-                .write()
-                .unwrap()
-                .demuxs
-                .iter_mut()
-                .enumerate()
-            {
+            let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+            let independent_readrate = ffmpeg_context.independent_readrate;
+            for (demux_idx, demux) in ffmpeg_context.demuxs.iter_mut().enumerate() {
+                let state = &self.get_input_state(demux_idx);
                 if let Err(e) = demux_init(
                     demux_idx,
                     demux,
                     independent_readrate,
                     packet_pool.clone(),
                     demux.node.clone(),
-                    scheduler_status.clone(),
-                    scheduler_result.clone(),
+                    state.status.clone(),
+                    state.result.clone(),
                 ) {
-                    Self::cleanup(&scheduler_status, ffmpeg_context);
+                    drop(ffmpeg_context);
+                    self.cleanup(&scheduler_status);
                     return Err(e);
                 }
             }
@@ -294,8 +300,25 @@ impl FfmpegDynamicScheduler {
 
         let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
         let demux_idx = ffmpeg_context.demuxs.len() + 1;
-
+        let state = &self.get_input_state(demux_idx);
         let mut demuxer = unsafe { open_input_file(demux_idx, &mut input, copy_ts) }?;
+
+        // Input frame filter pipeline
+        if let Some(frame_pipelines) = demuxer.frame_pipelines.take() {
+            for frame_pipeline in frame_pipelines {
+                if let Err(e) = input_pipeline_init(
+                    demux_idx,
+                    frame_pipeline,
+                    demuxer.get_streams_mut(),
+                    self.frame_pool.clone(),
+                    state.status.clone(),
+                    state.result.clone(),
+                ) {
+                    in_fmt_ctx_free(demuxer.in_fmt_ctx, demuxer.is_set_read_callback);
+                    return Err(e);
+                }
+            }
+        }
 
         // Decoder
         let exit_on_error = demuxer.exit_on_error;
@@ -306,14 +329,15 @@ impl FfmpegDynamicScheduler {
                 exit_on_error,
                 self.frame_pool.clone(),
                 self.packet_pool.clone(),
-                self.status.clone(),
-                self.result.clone(),
+                state.status.clone(),
+                state.result.clone(),
             ) {
                 in_fmt_ctx_free(demuxer.in_fmt_ctx, demuxer.is_set_read_callback);
                 return Err(e);
             }
         }
 
+        // Demuxer
         let node = demuxer.node.clone();
         if let Err(e) = demux_init(
             demux_idx,
@@ -321,8 +345,8 @@ impl FfmpegDynamicScheduler {
             ffmpeg_context.independent_readrate,
             self.packet_pool.clone(),
             node,
-            self.status.clone(),
-            self.result.clone(),
+            state.status.clone(),
+            state.result.clone(),
         ) {
             in_fmt_ctx_free(demuxer.in_fmt_ctx, demuxer.is_set_read_callback);
             return Err(e);
@@ -333,15 +357,61 @@ impl FfmpegDynamicScheduler {
         Ok(())
     }
 
-    fn cleanup(scheduler_status: &Arc<AtomicUsize>, ffmpeg_context: &Arc<RwLock<FfmpegContext>>) {
-        for mux in &ffmpeg_context.read().unwrap().muxs {
+    pub fn remove_input(&self, idx: usize) -> crate::error::Result<()> {
+        if let Some(state) = self.inputs_state.lock().unwrap().remove(&idx) {
+            state.status.store(STATUS_END, Ordering::Release);
+        }
+
+        let mut ffmpeg_context = self.ffmpeg_context.write().unwrap();
+        if let Some(demuxer) = ffmpeg_context.demuxs.get(idx) {
+            in_fmt_ctx_free(demuxer.in_fmt_ctx, demuxer.is_set_read_callback);
+            ffmpeg_context.demuxs.remove(idx);
+        }
+
+        Ok(())
+    }
+
+    fn cleanup(&self, scheduler_status: &Arc<AtomicUsize>) {
+        for mux in &self.ffmpeg_context.read().unwrap().muxs {
             out_fmt_ctx_free(mux.out_fmt_ctx, mux.is_set_write_callback);
         }
 
-        for demux in &ffmpeg_context.read().unwrap().demuxs {
+        for demux in &self.ffmpeg_context.read().unwrap().demuxs {
             in_fmt_ctx_free(demux.in_fmt_ctx, demux.is_set_read_callback);
         }
         scheduler_status.store(STATUS_END, Ordering::Release);
+    }
+
+    fn get_input_state(&self, idx: usize) -> State {
+        let mut a = self.inputs_state.lock().unwrap();
+
+        if let Some(a) = a.get(&idx) {
+            a.clone()
+        } else {
+            let s = State {
+                status: Arc::new(AtomicUsize::new(STATUS_INIT)),
+                result: Arc::new(Mutex::new(None)),
+            };
+            a.insert(idx, s.clone());
+
+            s
+        }
+    }
+
+    fn get_output_state(&self, idx: usize) -> State {
+        let mut a = self.outputs_state.lock().unwrap();
+
+        if let Some(a) = a.get(&idx) {
+            a.clone()
+        } else {
+            let s = State {
+                status: Arc::new(AtomicUsize::new(STATUS_INIT)),
+                result: Arc::new(Mutex::new(None)),
+            };
+            a.insert(idx, s.clone());
+
+            s
+        }
     }
 }
 
